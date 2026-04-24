@@ -17,7 +17,8 @@ const STATE = {
     isSyncingFromMD: false,
     liveSyncEnabled: false,
     saveTimeout: null,
-    syncTimeout: null
+    syncTimeout: null,
+    batch: { files: [], isRunning: false }
 };
 
 // --- DOM Elements ---
@@ -49,7 +50,14 @@ function initDOM() {
         rtCopyBtn: document.getElementById('rt-copy-btn'),
         rtPasteBtn: document.getElementById('rt-paste-btn'),
         mdCopyBtn: document.getElementById('md-copy-btn'),
-        mdPasteBtn: document.getElementById('md-paste-btn')
+        mdPasteBtn: document.getElementById('md-paste-btn'),
+        batchConvertBtn:     document.getElementById('batch-convert-btn'),
+        batchModal:          document.getElementById('batch-modal'),
+        closeBatchModalBtn:  document.getElementById('close-batch-modal'),
+        batchDropzone:       document.getElementById('batch-dropzone'),
+        batchFileInput:      document.getElementById('batch-file-input'),
+        batchConvertAllBtn:  document.getElementById('batch-convert-all-btn'),
+        batchDownloadZipBtn: document.getElementById('batch-download-zip-btn'),
     };
 }
 
@@ -494,181 +502,10 @@ async function handleAISummarize() {
     DOM.loadingOverlay.classList.remove('active');
 }
 
-/**
- * PDFConverter - Local PDF to Markdown Parser
- * Logic ported and enhanced from pdf_to_md.py
- * Features:
- * - Dynamic font hierarchy detection (H1, H2, H3 from top sizes)
- * - Text item grouping into lines
- * - Bold/Italic preservation
- * - Paragraph merging
- */
-const PDFConverter = {
-    async convert(file, onProgress) {
-        const arrayBuffer = await file.arrayBuffer();
-        const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
-        const pdf = await loadingTask.promise;
-        const totalPages = pdf.numPages;
-
-        let allPagesContent = [];
-        let fontSizeFreq = {};
-
-        // Pass 1: Extract all text items and analyze font sizes
-        for (let i = 1; i <= totalPages; i++) {
-            if (onProgress) onProgress(i, totalPages, 'Analyzing');
-            const page = await pdf.getPage(i);
-            const textContent = await page.getTextContent();
-            
-            // Wait for commonObjs to be ready
-            await page.getOperatorList(); 
-
-            // Collect font info
-            const items = textContent.items.map(item => {
-                const fontSize = Math.round(item.transform[0] * 10) / 10;
-                if (fontSize > 5) { // Skip tiny noise
-                    fontSizeFreq[fontSize] = (fontSizeFreq[fontSize] || 0) + item.str.length;
-                }
-                
-                // Try to resolve font style from commonObjs
-                let isBold = false;
-                let isItalic = false;
-                if (item.fontName) {
-                    const fontInfo = page.commonObjs.get(item.fontName);
-                    if (fontInfo && fontInfo.name) {
-                        const name = fontInfo.name.toLowerCase();
-                        isBold = name.includes('bold') || name.includes('condensed');
-                        isItalic = name.includes('italic') || name.includes('oblique');
-                    }
-                }
-
-                return {
-                    text: item.str,
-                    x: item.transform[4],
-                    y: item.transform[5],
-                    size: fontSize,
-                    isBold,
-                    isItalic
-                };
-            });
-
-            allPagesContent.push({ items });
-        }
-
-        // Determine dynamic hierarchy
-        const sortedSizes = Object.keys(fontSizeFreq)
-            .map(Number)
-            .sort((a, b) => b - a); // Largest first
-
-        // Find the most frequent size as the "Body" text size
-        const bodySize = Number(Object.entries(fontSizeFreq).reduce((a, b) => a[1] > b[1] ? a : b)[0]);
-        const headingSizes = sortedSizes.filter(s => s > bodySize);
-
-        const H1_SIZE = headingSizes[0] || 24;
-        const H2_SIZE = headingSizes[1] || 18;
-        const H3_SIZE = headingSizes[2] || 14;
-
-        console.log(`Detected Sizes: H1=${H1_SIZE}, H2=${H2_SIZE}, H3=${H3_SIZE}, Body=${bodySize}`);
-
-        let markdownLines = [];
-
-        // Pass 2: Grouping items into lines and classifying
-        for (let i = 0; i < allPagesContent.length; i++) {
-            if (onProgress) onProgress(i + 1, totalPages, 'Converting');
-            const { items } = allPagesContent[i];
-            
-            // Group by Y (within a small threshold)
-            const linesMap = new Map();
-            items.forEach(item => {
-                const y = Math.round(item.y);
-                let found = false;
-                for (let [ly, lineItems] of linesMap) {
-                    if (Math.abs(y - ly) < 3) {
-                        lineItems.push(item);
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) linesMap.set(y, [item]);
-            });
-
-            // Sort lines by Y descending
-            const sortedLines = Array.from(linesMap.entries())
-                .sort((a, b) => b[0] - a[0])
-                .map(([y, lineItems]) => lineItems.sort((a, b) => a.x - b.x));
-
-            sortedLines.forEach(lineItems => {
-                const domItem = lineItems.reduce((a, b) => a.size * a.text.length > b.size * b.text.length ? a : b);
-                const rawLineText = lineItems.map(it => it.text).join('').trim();
-                
-                if (!rawLineText) return;
-
-                // Handle inline formatting
-                const lineTextFormatted = lineItems.map(it => {
-                    let t = it.text;
-                    if (it.isBold && it.size <= H3_SIZE) t = `**${t}**`;
-                    if (it.isItalic && it.size <= H3_SIZE) t = `*${t}*`;
-                    return t;
-                }).join('').trim();
-
-                // Skip running headers/footers
-                if (domItem.size <= 10.5 && (rawLineText.match(/^\d+$/) || rawLineText.length < 5)) return;
-
-                if (domItem.size >= H1_SIZE && domItem.isBold) {
-                    markdownLines.push(`# ${rawLineText}\n`);
-                } else if (domItem.size >= H2_SIZE && domItem.isBold) {
-                    markdownLines.push(`## ${rawLineText}\n`);
-                } else if (domItem.size >= H3_SIZE && domItem.isBold) {
-                    markdownLines.push(`### ${rawLineText}\n`);
-                } else if (rawLineText.startsWith('•') || rawLineText.startsWith('■') || rawLineText.startsWith('-')) {
-                    markdownLines.push(`- ${rawLineText.replace(/^[•■-]\s*/, '')}`);
-                } else {
-                    markdownLines.push(lineTextFormatted);
-                }
-            });
-            markdownLines.push(""); 
-        }
-
-        return this.mergeParagraphs(markdownLines);
-    },
-
-    mergeParagraphs(lines) {
-        const result = [];
-        let buffer = [];
-
-        const flush = () => {
-            if (buffer.length > 0) {
-                result.push(buffer.join(' ').replace(/\s+/g, ' '));
-                buffer = [];
-            }
-        };
-
-        lines.forEach(line => {
-            const trimmed = line.trim();
-            if (!trimmed) {
-                flush();
-                result.push("");
-                return;
-            }
-
-            if (trimmed.startsWith('#') || trimmed.startsWith('-')) {
-                flush();
-                result.push(trimmed);
-            } else {
-                buffer.push(trimmed);
-            }
-        });
-
-        flush();
-
-        return result.filter((l, i, arr) => !(l === "" && arr[i-1] === "")).join('\n');
-    }
-};
-
-async function handlePdfUpload(e) {
+async function handleFileUpload(e) {
     const file = e.target.files[0];
     if (!file) return;
 
-    // Increased limit to 50MB for local processing
     const MAX_SIZE = 50 * 1024 * 1024;
     if (file.size > MAX_SIZE) {
         showToast("File is too large! Maximum size is 50MB.", "fa-circle-exclamation");
@@ -676,45 +513,46 @@ async function handlePdfUpload(e) {
         return;
     }
 
-    const uploadBtn = document.getElementById('upload-pdf-btn');
+    const uploadBtn = document.getElementById('upload-file-btn');
     const originalHtml = uploadBtn.innerHTML;
-    uploadBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> PARSING...';
+    uploadBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> CONVERTING...';
     uploadBtn.disabled = true;
 
     DOM.loadingOverlay.classList.add('active');
-    
+    if (DOM.loadingTitle) DOM.loadingTitle.innerText = "Converting File";
+    if (DOM.loadingSubtitle) DOM.loadingSubtitle.innerText = `Sending ${file.name} to local markitdown server...`;
+
     try {
-        const md = await PDFConverter.convert(file, (current, total, phase) => {
-            if (DOM.loadingTitle) DOM.loadingTitle.innerText = `${phase} PDF`;
-            if (DOM.loadingSubtitle) DOM.loadingSubtitle.innerText = `Page ${current} of ${total}...`;
-        });
+        const formData = new FormData();
+        formData.append('file', file);
 
-        if (md) {
-            // Load to RT first
-            const html = marked.parse(md);
-            quill.clipboard.dangerouslyPasteHTML(html);
+        const response = await fetch('/api/convert', { method: 'POST', body: formData });
 
-            // Then sync to MD editor
-            DOM.markdownInput.value = md;
-
-            saveToLocal();
-
-            if (DOM.loadingTitle) DOM.loadingTitle.innerText = "All Set!";
-            if (DOM.loadingSubtitle) DOM.loadingSubtitle.innerText = "Your content has been imported to the editor.";
-
-            setTimeout(() => {
-                DOM.loadingOverlay.classList.remove('active');
-                uploadBtn.innerHTML = originalHtml;
-                uploadBtn.disabled = false;
-                showToast("PDF Converted Locally");
-            }, 1000);
-        } else {
-            throw new Error("No content found");
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({ detail: response.statusText }));
+            throw new Error(err.detail || response.statusText);
         }
 
+        const { markdown: md } = await response.json();
+
+        const html = marked.parse(md);
+        quill.clipboard.dangerouslyPasteHTML(fixHTMLForQuill(html));
+        DOM.markdownInput.value = md;
+        saveToLocal();
+
+        if (DOM.loadingTitle) DOM.loadingTitle.innerText = "All Set!";
+        if (DOM.loadingSubtitle) DOM.loadingSubtitle.innerText = "Your content has been imported to the editor.";
+
+        setTimeout(() => {
+            DOM.loadingOverlay.classList.remove('active');
+            uploadBtn.innerHTML = originalHtml;
+            uploadBtn.disabled = false;
+            showToast(`${file.name} imported`);
+        }, 800);
+
     } catch (err) {
-        console.error("PDF Parsing Error:", err);
-        showToast(`PDF Failed: ${err.message}`, "fa-circle-exclamation");
+        console.error("File conversion error:", err);
+        showToast(`Import failed: ${err.message}`, "fa-circle-exclamation");
         DOM.loadingOverlay.classList.remove('active');
         uploadBtn.innerHTML = originalHtml;
         uploadBtn.disabled = false;
@@ -723,6 +561,168 @@ async function handlePdfUpload(e) {
     }
 }
 
+
+// ===== BATCH CONVERT =====
+
+function makeBatchFile(file) {
+    return { id: crypto.randomUUID(), file, name: file.name, size: file.size,
+             status: 'queued', markdown: '', errorMsg: '' };
+}
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+function renderBatchFileList() {
+    const listEl         = document.getElementById('batch-file-list');
+    const convertAllBtn  = document.getElementById('batch-convert-all-btn');
+    const downloadZipBtn = document.getElementById('batch-download-zip-btn');
+    const summaryEl      = document.getElementById('batch-summary');
+    const files          = STATE.batch.files;
+
+    listEl.style.display = files.length > 0 ? 'block' : 'none';
+    listEl.innerHTML = '';
+
+    const badges = {
+        queued:     ['batch-status--queued',     'fa-clock',              'QUEUED'],
+        converting: ['batch-status--converting', 'fa-spinner',            'CONVERTING'],
+        done:       ['batch-status--done',       'fa-circle-check',       'DONE'],
+        error:      ['batch-status--error',      'fa-circle-exclamation', 'ERROR'],
+    };
+
+    files.forEach(bf => {
+        const row = document.createElement('div');
+        row.className = 'batch-file-row';
+        const [badgeClass, badgeIcon, badgeLabel] = badges[bf.status] || badges.queued;
+        row.innerHTML = `
+            <span class="batch-file-row__name" title="${bf.name}">${bf.name}</span>
+            <span class="batch-file-row__size">${formatFileSize(bf.size)}</span>
+            <span class="batch-status ${badgeClass}"><i class="fa-solid ${badgeIcon}"></i>${badgeLabel}</span>
+            <button class="batch-file-row__download" style="display:${bf.status === 'done' ? 'inline-flex' : 'none'}" data-id="${bf.id}">
+                <i class="fa-solid fa-download"></i> .MD
+            </button>`;
+        listEl.appendChild(row);
+
+        if (bf.status === 'error' && bf.errorMsg) {
+            const errRow = document.createElement('div');
+            errRow.className = 'batch-file-row--error-detail';
+            errRow.textContent = bf.errorMsg;
+            listEl.appendChild(errRow);
+        }
+    });
+
+    listEl.querySelectorAll('.batch-file-row__download').forEach(btn => {
+        btn.addEventListener('click', () => batchDownloadSingle(btn.dataset.id));
+    });
+
+    const hasQueued = files.some(f => f.status === 'queued');
+    const hasDone   = files.some(f => f.status === 'done');
+    convertAllBtn.disabled  = !hasQueued || STATE.batch.isRunning;
+    downloadZipBtn.disabled = !hasDone;
+
+    if (files.length > 0) {
+        const total  = files.length;
+        const done   = files.filter(f => f.status === 'done').length;
+        const errors = files.filter(f => f.status === 'error').length;
+        const parts  = [`${total} file${total !== 1 ? 's' : ''}`];
+        if (done)   parts.push(`${done} done`);
+        if (errors) parts.push(`${errors} failed`);
+        summaryEl.textContent = parts.join(' · ');
+    } else {
+        summaryEl.textContent = '';
+    }
+}
+
+function batchAddFiles(fileList) {
+    const existingNames = new Set(STATE.batch.files.map(f => f.name));
+    let added = 0;
+    Array.from(fileList).forEach(file => {
+        if (existingNames.has(file.name)) return;
+        existingNames.add(file.name);
+        STATE.batch.files.push(makeBatchFile(file));
+        added++;
+    });
+    renderBatchFileList();
+    if (added > 0) showToast(`${added} file${added !== 1 ? 's' : ''} added`, 'fa-layer-group');
+}
+
+async function batchConvertSingle(bf) {
+    bf.status = 'converting';
+    renderBatchFileList();
+    try {
+        const formData = new FormData();
+        formData.append('file', bf.file);
+        const response = await fetch('/api/convert', { method: 'POST', body: formData });
+        if (!response.ok) {
+            const err = await response.json().catch(() => ({ detail: response.statusText }));
+            throw new Error(err.detail || response.statusText);
+        }
+        const { markdown } = await response.json();
+        bf.status = 'done';
+        bf.markdown = markdown;
+    } catch (err) {
+        bf.status = 'error';
+        bf.errorMsg = err.message || 'Conversion failed';
+    }
+    renderBatchFileList();
+}
+
+async function batchConvertAll() {
+    if (STATE.batch.isRunning) return;
+    STATE.batch.isRunning = true;
+    renderBatchFileList();
+    const toProcess = STATE.batch.files.filter(f => f.status === 'queued');
+    for (const bf of toProcess) {
+        if (bf.status !== 'queued') continue;
+        await batchConvertSingle(bf);
+    }
+    STATE.batch.isRunning = false;
+    renderBatchFileList();
+    const done   = STATE.batch.files.filter(f => f.status === 'done').length;
+    const errors = STATE.batch.files.filter(f => f.status === 'error').length;
+    showToast(
+        errors === 0 ? `All ${done} files converted` : `${done} done, ${errors} failed`,
+        errors === 0 ? 'fa-circle-check' : 'fa-circle-exclamation'
+    );
+}
+
+function batchDownloadSingle(id) {
+    const bf = STATE.batch.files.find(f => f.id === id);
+    if (!bf || bf.status !== 'done') return;
+    const baseName = bf.name.replace(/\.[^/.]+$/, '');
+    const blob = new Blob([bf.markdown], { type: 'text/markdown' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `${baseName}.md`; a.click();
+    URL.revokeObjectURL(url);
+}
+
+async function batchDownloadZip() {
+    const doneFiles = STATE.batch.files.filter(f => f.status === 'done');
+    if (!doneFiles.length) return;
+    const zip = new JSZip();
+    doneFiles.forEach(bf => zip.file(`${bf.name.replace(/\.[^/.]+$/, '')}.md`, bf.markdown));
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = 'batch-convert.zip'; a.click();
+    URL.revokeObjectURL(url);
+    showToast(`${doneFiles.length} files zipped`, 'fa-file-zipper');
+}
+
+function openBatchModal() {
+    document.getElementById('batch-modal').classList.add('active');
+}
+
+function closeBatchModal() {
+    STATE.batch.files = [];
+    STATE.batch.isRunning = false;
+    document.getElementById('batch-file-input').value = '';
+    renderBatchFileList();
+    document.getElementById('batch-modal').classList.remove('active');
+}
 
 // --- Initialization ---
 window.addEventListener('DOMContentLoaded', () => {
@@ -780,11 +780,11 @@ window.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    const pdfBtn = document.getElementById('upload-pdf-btn');
-    const pdfInput = document.getElementById('pdf-upload');
-    if (pdfBtn && pdfInput) {
-        pdfBtn.addEventListener('click', () => pdfInput.click());
-        pdfInput.addEventListener('change', handlePdfUpload);
+    const fileBtn = document.getElementById('upload-file-btn');
+    const fileInput = document.getElementById('file-upload');
+    if (fileBtn && fileInput) {
+        fileBtn.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', handleFileUpload);
     }
 
     DOM.markdownInput.addEventListener('input', handleMDChange);
@@ -828,4 +828,28 @@ window.addEventListener('DOMContentLoaded', () => {
         STATE.liveSyncEnabled = true;
         DOM.liveSyncToggle.classList.add('sync-active');
     }
+
+    // ---- Batch Convert ----
+    DOM.batchConvertBtn.addEventListener('click', openBatchModal);
+    DOM.closeBatchModalBtn.addEventListener('click', closeBatchModal);
+    window.addEventListener('click', (e) => { if (e.target === DOM.batchModal) closeBatchModal(); });
+    DOM.batchDropzone.addEventListener('click', () => DOM.batchFileInput.click());
+    DOM.batchFileInput.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) batchAddFiles(e.target.files);
+        e.target.value = '';
+    });
+    DOM.batchDropzone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        DOM.batchDropzone.classList.add('dragover');
+    });
+    DOM.batchDropzone.addEventListener('dragleave', (e) => {
+        if (!DOM.batchDropzone.contains(e.relatedTarget)) DOM.batchDropzone.classList.remove('dragover');
+    });
+    DOM.batchDropzone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        DOM.batchDropzone.classList.remove('dragover');
+        if (e.dataTransfer.files.length > 0) batchAddFiles(e.dataTransfer.files);
+    });
+    DOM.batchConvertAllBtn.addEventListener('click', batchConvertAll);
+    DOM.batchDownloadZipBtn.addEventListener('click', batchDownloadZip);
 });
