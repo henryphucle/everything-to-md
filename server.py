@@ -4,11 +4,19 @@ import os
 import tempfile
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from markitdown import MarkItDown
 
 app = FastAPI(title="everythingToMD API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 converter = MarkItDown(enable_plugins=False)
 
 MAX_SIZE = 50 * 1024 * 1024  # 50 MB
@@ -104,8 +112,6 @@ async def convert_file_stream(file: UploadFile = File(...)):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-# Static files must be mounted last so API routes take precedence.
-app.mount("/", StaticFiles(directory="dist", html=True), name="static")
-
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
